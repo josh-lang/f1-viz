@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>F1 Championship Flow</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #0a0a0a;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        
+        #controls {
+            position: sticky;
+            top: 0;
+            background: #0a0a0a;
+            padding: 20px 0;
+            z-index: 100;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        select, button {
+            padding: 8px 12px;
+            background: #1a1a1a;
+            color: #fff;
+            border: 1px solid #333;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        #chart-container {
+            overflow-x: auto;
+            overflow-y: hidden;
+            background: #0f0f0f;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        
+        .driver-flow {
+            fill-opacity: 0.8;
+            stroke-width: 2;
+        }
+        
+        .driver-label {
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .race-label {
+            font-size: 11px;
+            fill: #666;
+        }
+        
+        .loading {
+            color: #666;
+            font-style: italic;
+        }
+        
+        .error {
+            color: #ff4444;
+        }
+    </style>
+</head>
+<body>
+    <h1>F1 Championship Flow</h1>
+    
+    <div id="controls">
+        <select id="season-select">
+            <option value="2024">2024 Season</option>
+            <option value="2023">2023 Season</option>
+            <option value="2022">2022 Season</option>
+            <option value="2021">2021 Season</option>
+            <option value="2020">2020 Season</option>
+        </select>
+        <button id="load-btn">Load Season</button>
+        <select id="viz-type">
+            <option value="area">Area Stream</option>
+            <option value="line">Line Race</option>
+            <option value="bump">Bump Chart</option>
+        </select>
+    </div>
+    
+    <div id="status"></div>
+    <div id="chart-container"></div>
+
+    <script>
+        // Configuration
+        const config = {
+            margin: { top: 60, right: 200, bottom: 100, left: 60 },
+            raceWidth: 100,
+            height: 600,
+            teamColors: {
+                'red_bull': '#1e41ff',
+                'mercedes': '#00d2be', 
+                'ferrari': '#dc0000',
+                'mclaren': '#ff8700',
+                'aston_martin': '#006f62',
+                'alpine': '#0090ff',
+                'williams': '#005aff',
+                'alphatauri': '#2b4562',
+                'alfa': '#900000',
+                'haas': '#ffffff'
+            }
+        };
+
+        // State
+        let currentData = null;
+        let currentView = 'area';
+
+        // Data fetching
+        async function fetchSeasonData(season) {
+            const status = d3.select('#status');
+            status.attr('class', 'loading').text('Fetching race data...');
+            
+            try {
+                const response = await fetch(`https://ergast.com/api/f1/${season}/results.json?limit=1000`);
+                const data = await response.json();
+                
+                if (!data.MRData.RaceTable.Races.length) {
+                    throw new Error('No races found for this season');
+                }
+                
+                status.text('Processing data...');
+                const processed = processRaceData(data.MRData.RaceTable.Races);
+                
+                status.text('');
+                return processed;
+                
+            } catch (error) {
+                status.attr('class', 'error').text(`Error: ${error.message}`);
+                console.error(error);
+                return null;
+            }
+        }
+
+        // Data processing
+        function processRaceData(races) {
+            const driversMap = new Map();
+            const raceNames = races.map(r => r.Circuit.Location.locality);
+            
+            // Build cumulative points for each driver
+            races.forEach((race, raceIdx) => {
+                race.Results.forEach(result => {
+                    const driverId = result.Driver.driverId;
+                    const points = +result.points || 0;
+                    
+                    if (!driversMap.has(driverId)) {
+                        driversMap.set(driverId, {
+                            id: driverId,
+                            name: result.Driver.familyName,
+                            fullName: `${result.Driver.givenName} ${result.Driver.familyName}`,
+                            team: result.Constructor.constructorId,
+                            races: []
+                        });
+                    }
+                    
+                    const driver = driversMap.get(driverId);
+                    const cumPoints = driver.races.length > 0 
+                        ? driver.races[driver.races.length - 1].cumPoints + points 
+                        : points;
+                    
+                    driver.races.push({
+                        raceIndex: raceIdx,
+                        raceName: raceNames[raceIdx],
+                        position: +result.position,
+                        points: points,
+                        cumPoints: cumPoints
+                    });
+                });
+            });
+            
+            // Convert to array and filter to championship contenders
+            const drivers = Array.from(driversMap.values())
+                .sort((a, b) => {
+                    const aFinal = a.races[a.races.length - 1]?.cumPoints || 0;
+                    const bFinal = b.races[b.races.length - 1]?.cumPoints || 0;
+                    return bFinal - aFinal;
+                })
+                .slice(0, 10); // Top 10 for clarity
+            
+            return {
+                drivers,
+                raceNames,
+                raceCount: races.length
+            };
+        }
+
+        // Visualization functions
+        function createAreaChart(data) {
+            const { drivers, raceNames, raceCount } = data;
+            const width = config.margin.left + config.margin.right + (raceCount * config.raceWidth);
+            
+            // Clear previous
+            d3.select('#chart-container').selectAll('*').remove();
+            
+            // Create SVG
+            const svg = d3.select('#chart-container')
+                .append('svg')
+                .attr('width', width)
+                .attr('height', config.height + config.margin.top + config.margin.bottom);
+            
+            const g = svg.append('g')
+                .attr('transform', `translate(${config.margin.left},${config.margin.top})`);
+            
+            // Scales
+            const x = d3.scaleLinear()
+                .domain([0, raceCount - 1])
+                .range([0, raceCount * config.raceWidth]);
+            
+            const maxPoints = d3.max(drivers, d => d3.max(d.races, r => r.cumPoints));
+            const y = d3.scaleLinear()
+                .domain([0, maxPoints])
+                .range([config.height, 0]);
+            
+            // Create stack data
+            const stackData = [];
+            for (let i = 0; i < raceCount; i++) {
+                const raceData = { race: i };
+                drivers.forEach(driver => {
+                    const race = driver.races.find(r => r.raceIndex === i);
+                    raceData[driver.id] = race ? race.cumPoints : 0;
+                });
+                stackData.push(raceData);
+            }
+            
+            const stack = d3.stack()
+                .keys(drivers.map(d => d.id))
+                .order(d3.stackOrderDescending)
+                .offset(d3.stackOffsetNone);
+            
+            const series = stack(stackData);
+            
+            // Area generator
+            const area = d3.area()
+                .x((d, i) => x(i))
+                .y0(d => y(d[0]))
+                .y1(d => y(d[1]))
+                .curve(d3.curveMonotoneX);
+            
+            // Draw areas
+            g.selectAll('.driver-flow')
+                .data(series)
+                .enter().append('path')
+                .attr('class', 'driver-flow')
+                .attr('d', area)
+                .style('fill', (d, i) => {
+                    const driver = drivers.find(dr => dr.id === d.key);
+                    return config.teamColors[driver.team] || '#666';
+                })
+                .style('stroke', 'none');
+            
+            // Add race labels
+            g.selectAll('.race-label')
+                .data(raceNames)
+                .enter().append('text')
+                .attr('class', 'race-label')
+                .attr('transform', (d, i) => `translate(${x(i)}, ${config.height + 20}) rotate(-45)`)
+                .text(d => d);
+            
+            // Add driver labels
+            const labelGroup = g.append('g')
+                .attr('transform', `translate(${raceCount * config.raceWidth + 10}, 0)`);
+            
+            drivers.forEach((driver, i) => {
+                const lastRace = driver.races[driver.races.length - 1];
+                if (!lastRace) return;
+                
+                const seriesData = series.find(s => s.key === driver.id);
+                const lastPoint = seriesData[seriesData.length - 1];
+                const yPos = y((lastPoint[0] + lastPoint[1]) / 2);
+                
+                labelGroup.append('text')
+                    .attr('class', 'driver-label')
+                    .attr('x', 0)
+                    .attr('y', yPos)
+                    .attr('dy', '0.35em')
+                    .style('fill', config.teamColors[driver.team] || '#666')
+                    .text(`${driver.name} (${lastRace.cumPoints})`);
+            });
+            
+            // Title
+            svg.append('text')
+                .attr('x', config.margin.left)
+                .attr('y', 30)
+                .style('font-size', '16px')
+                .style('font-weight', 'bold')
+                .text(`Championship Flow - ${raceCount} races`);
+        }
+
+        // Event handlers
+        d3.select('#load-btn').on('click', async () => {
+            const season = d3.select('#season-select').property('value');
+            currentData = await fetchSeasonData(season);
+            if (currentData) {
+                createAreaChart(currentData);
+            }
+        });
+
+        d3.select('#viz-type').on('change', () => {
+            currentView = d3.select('#viz-type').property('value');
+            if (currentData) {
+                // TODO: Implement other visualization types
+                if (currentView === 'area') {
+                    createAreaChart(currentData);
+                } else {
+                    d3.select('#status')
+                        .attr('class', 'loading')
+                        .text(`${currentView} view coming soon...`);
+                }
+            }
+        });
+
+        // Load initial season
+        d3.select('#load-btn').dispatch('click');
+    </script>
+</body>
+</html>
